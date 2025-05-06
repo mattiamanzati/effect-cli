@@ -1,0 +1,13 @@
+{
+  "name": "effect-cli",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "A CLI to manage Effect applications",
+  "main": "bin.cjs",
+  "bin": "bin.cjs",
+  "repository": {
+    "type": "git",
+    "url": "<PLACEHOLDER>"
+  },
+  "license": "MIT"
+}
