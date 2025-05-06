@@ -132,6 +132,9 @@ const update = Command.make(
         yield* Effect.log("About to install dependencies " + Array.from(deps).join(" "))
         yield* PackageManager.install(deps, { save: true, saveDev: false, savePeer: false })
       }
+
+      yield* Effect.log("Deduping...")
+      yield* PackageManager.dedupe
     })
 )
 

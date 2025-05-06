@@ -51,3 +51,20 @@ export const install = (packageNames: HashSet.HashSet<PackageJson.PackageNameAnd
     )
     yield* handle.exitCode
   }).pipe(Effect.scoped)
+
+export const dedupe = Effect.gen(function*() {
+  const executor = yield* CommandExecutor.CommandExecutor
+
+  const command = Command.make(
+    "pnpm",
+    "dedupe"
+  ).pipe(
+    Command.stderr("inherit"),
+    Command.stdout("inherit"),
+    Command.stdin("inherit")
+  )
+  const handle = yield* executor.start(command).pipe(
+    Effect.mapError((issue) => new PackageManagerError({ issue }))
+  )
+  yield* handle.exitCode
+}).pipe(Effect.scoped)
