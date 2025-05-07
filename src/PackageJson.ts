@@ -13,6 +13,9 @@ export const DependenciesRecord = Schema.Record({
 })
 export type DependenciesRecord = Schema.Schema.Type<typeof DependenciesRecord>
 
+const dependenciesToNameVersion = (deps: DependenciesRecord) =>
+  Object.entries(deps).map(([name, version]) => new PackageNameAndVersion({ name, version }))
+
 export class PackageJson extends Schema.Class<PackageJson>("PackageJson")({
   name: Schema.NonEmptyString,
   version: Schema.NonEmptyString,
@@ -34,9 +37,9 @@ export class PackageJson extends Schema.Class<PackageJson>("PackageJson")({
   }
   get anyDependencies() {
     return pipe(
-      Object.keys(this.dependencies),
-      Array.appendAll(Object.keys(this.devDependencies)),
-      Array.appendAll(Object.keys(this.peerDependencies)),
+      dependenciesToNameVersion(this.dependencies),
+      Array.appendAll(dependenciesToNameVersion(this.devDependencies)),
+      Array.appendAll(dependenciesToNameVersion(this.peerDependencies)),
       Array.dedupe
     )
   }

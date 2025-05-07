@@ -29,11 +29,6 @@ const savePeer = Options.boolean("save-peer").pipe(
   Options.withDescription("Save into the dev dependencies the packages")
 )
 
-const excludeEffectPeers = Options.boolean("exclude-effect-peers").pipe(
-  Options.withDefault(false),
-  Options.withDescription("Installs peer effect packages as well")
-)
-
 const ignoreInstalled = Options.boolean("ignore-installed").pipe(
   Options.withDefault(false),
   Options.withDescription("Ignore already installed packages versions while searching compatible ones")
@@ -41,7 +36,7 @@ const ignoreInstalled = Options.boolean("ignore-installed").pipe(
 
 const install = Command.make(
   "install",
-  { packages, save, saveDev, savePeer, excludeEffectPeers, ignoreInstalled },
+  { packages, save, saveDev, savePeer, ignoreInstalled },
   (args) =>
     Effect.gen(function*() {
       const installedEffect = yield* ResolutionAlgo.getInstalledEffect
@@ -56,7 +51,12 @@ const install = Command.make(
         alreadyInstalledPackages
       )
 
-      yield* Effect.logInfo("Installing " + Array.fromIterable(finalInstallSet).map((_) => _.nameAndVersion).join(" "))
+      yield* Effect.logInfo("Installing " + Array.fromIterable(finalInstallSet).join(" "))
+      yield* PackageManager.install(finalInstallSet, {
+        save: args.save,
+        saveDev: args.saveDev,
+        savePeer: args.savePeer
+      })
     })
 )
 
@@ -108,7 +108,6 @@ const update = Command.make(
       )
       const finalInstallSet = pipe(
         packagesChoses,
-        HashSet.map((_) => _.nameAndVersion),
         HashSet.add(chosenEffectVersion)
       )
 
@@ -129,25 +128,40 @@ const update = Command.make(
         yield* Effect.logInfo("Installing dependencies " + Array.fromIterable(dependencies).join(" "))
         yield* PackageManager.install(dependencies, { save: true, saveDev: false, savePeer: false })
       }
+
+      if (HashSet.size(finalInstallSet) > 0) {
+        yield* Effect.logInfo("Deduping...")
+        yield* PackageManager.dedupe
+      }
     })
 )
 
-const test = Command.make(
-  "test",
+const doctor = Command.make(
+  "doctor",
   {},
   () =>
     Effect.gen(function*() {
+      yield* Effect.logInfo("Reading package.json...")
       const myPackageJson = yield* PackageResolver.readPackageJson(".")
-      yield* Effect.log(
-        yield* ResolutionAlgo.listDependenciesRequireEffect(myPackageJson)
-      )
+
+      const installedEffect = yield* ResolutionAlgo.getInstalledEffect
+      yield* Effect.logInfo("Detected installed " + installedEffect)
+
+      for (const packageJson of yield* ResolutionAlgo.listDependenciesRequireEffect(myPackageJson)) {
+        const result = PackageJson.matchPeers(packageJson, HashSet.fromIterable([installedEffect]))
+        if (!result.hasValid(installedEffect)) {
+          yield* Effect.logError("KO " + packageJson.nameAndVersion + " is incompatible with " + installedEffect)
+        } else {
+          yield* Effect.log("OK " + packageJson.nameAndVersion)
+        }
+      }
     })
 )
 
 const effectCli = Command.make(
   "effect-cli"
 ).pipe(
-  Command.withSubcommands([install, update, test])
+  Command.withSubcommands([install, update, doctor])
 )
 
 export const run: any = Command.run(effectCli, {

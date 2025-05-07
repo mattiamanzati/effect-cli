@@ -33,7 +33,7 @@ class NoPackageVersionCompatibleWithEffectError extends Data.TaggedError("NoPack
 }
 
 class NoCandidateForPackageCompatibleWithPeers extends Data.TaggedError("NoCandidateForPackageCompatibleWithPeers")<{
-  packageSpec: PackageJson.PackageNameAndVersion
+  packageName: string
 }> {}
 
 export function process(
@@ -42,53 +42,68 @@ export function process(
   alreadyInstalledPackages: HashSet.HashSet<PackageJson.PackageNameAndVersion>
 ) {
   return Effect.gen(function*() {
+    let currentInstalled = alreadyInstalledPackages
+    let currentRequestList = requestedPackages
+    let repeatAgain = true
+    let lastInstallSet = HashSet.empty<PackageJson.PackageJson>()
+    while (repeatAgain) {
+      repeatAgain = false
+      lastInstallSet = yield* processIteration(installedEffect, currentRequestList, currentInstalled)
+      for (const toInstall of lastInstallSet) {
+        currentInstalled = pipe(
+          currentInstalled,
+          HashSet.filter((_) => _.name !== toInstall.name),
+          HashSet.add(toInstall.nameAndVersion)
+        )
+        for (const dependency of toInstall.anyDependencies) {
+          if (dependency.name === "effect") continue
+          if (!dependency.name.startsWith("@effect")) continue
+          if (Option.isSome(Array.findFirst(currentRequestList, (_) => _.name === dependency.name))) continue
+          if (HashSet.size(HashSet.filter(currentInstalled, (_) => _.name === dependency.name)) > 0) continue
+          currentRequestList = Array.append(currentRequestList, dependency)
+          repeatAgain = true
+        }
+      }
+    }
+
+    return HashSet.map(lastInstallSet, (_) => _.nameAndVersion)
+  })
+}
+
+function processIteration(
+  installedEffect: PackageJson.PackageNameAndVersion,
+  requestedPackages: Array<PackageJson.PackageNameAndVersion>,
+  alreadyInstalledPackages: HashSet.HashSet<PackageJson.PackageNameAndVersion>
+) {
+  return Effect.gen(function*() {
     const installedEffectAsHash = HashSet.fromIterable([installedEffect])
     const requestedPackageNames = Array.map(requestedPackages, (_) => _.name)
-    yield* Effect.logInfo("Searching effect-compatible " + requestedPackages.join(" "))
 
     let allCompatiblePackages: Array<PackageJson.PackageJson> = []
-    let allPeerPackages = HashSet.empty<string>()
 
     for (const pkg of requestedPackages) {
-      const packageList = yield* PackageResolver.list(pkg)
-      const effectMatchedList = pipe(
-        packageList,
+      const packageVersionsCompatibleWithEffect = pipe(
+        yield* PackageResolver.list(pkg),
         Array.map((_) => PackageJson.matchPeers(_, installedEffectAsHash)),
         Array.filter((_) => _.hasValid(installedEffect))
       )
-
-      if (effectMatchedList.length === 0) {
-        return yield* new NoPackageVersionCompatibleWithEffectError({ packageSpec: pkg, effect: installedEffect })
-      }
-
       allCompatiblePackages = Array.appendAll(
         allCompatiblePackages,
-        Array.map(effectMatchedList, (_) => _.packageJson)
+        Array.map(packageVersionsCompatibleWithEffect, (_) => _.packageJson)
       )
-      yield* Effect.logDebug(pkg + ": " + Array.map(effectMatchedList, (_) => _.packageJson.version).join(" "))
-      const peerNamesForMatches = pipe(
-        effectMatchedList,
-        Array.map((_) => HashSet.toValues(_.missing)),
-        Array.flatten,
-        Array.map((_) => _.name),
-        HashSet.fromIterable
-      )
-      allPeerPackages = HashSet.union(allPeerPackages, peerNamesForMatches)
     }
 
-    yield* Effect.logInfo("involved peers " + Array.fromIterable(allPeerPackages).join(" "))
+    for (const packageSpec of requestedPackages) {
+      const versionToTest = Array.findLast(allCompatiblePackages, (candidate) => candidate.name === packageSpec.name)
+      if (Option.isNone(versionToTest)) {
+        return yield* new NoPackageVersionCompatibleWithEffectError({ effect: installedEffect, packageSpec })
+      }
+    }
 
     const installedPeers = pipe(
       alreadyInstalledPackages,
-      HashSet.filter((_) => HashSet.has(allPeerPackages, _.name)),
       HashSet.filter((_) => requestedPackageNames.indexOf(_.name) === -1)
     )
-
-    if (HashSet.size(installedPeers) > 0) {
-      yield* Effect.logInfo(
-        "Checking packages compatible with already installed " + Array.fromIterable(installedPeers).join(" ")
-      )
-    }
 
     let currentCandidates = allCompatiblePackages
     let finalInstallSet = HashSet.empty<PackageJson.PackageJson>()
@@ -96,11 +111,11 @@ export function process(
     while (true) {
       let candidateRemoved = false
       finalInstallSet = HashSet.empty()
-      for (const requestedPkg of requestedPackages) {
+      for (const packageName of requestedPackageNames) {
         // start by picking the latest version
-        const versionToTest = Array.findLast(currentCandidates, (candidate) => candidate.name === requestedPkg.name)
+        const versionToTest = Array.findLast(currentCandidates, (candidate) => candidate.name === packageName)
         if (Option.isNone(versionToTest)) {
-          return yield* new NoCandidateForPackageCompatibleWithPeers({ packageSpec: requestedPkg })
+          return yield* new NoCandidateForPackageCompatibleWithPeers({ packageName })
         }
         const pickedVersion = versionToTest.value
 
@@ -132,12 +147,11 @@ export function process(
 
 export function listDependenciesRequireEffect(packageJson: PackageJson.PackageJson) {
   return Effect.gen(function*() {
-    const paths = yield* PackageResolver.listPathsFor(packageJson.anyDependencies)
+    const paths = yield* PackageResolver.listPathsFor(Array.map(packageJson.anyDependencies, (_) => _.name))
 
     return pipe(
       yield* Effect.forEach(paths, (_) => PackageResolver.readPackageJson(_)),
-      Array.filter((_) => "effect" in _.peerDependencies),
-      Array.map((_) => _.nameAndVersion)
+      Array.filter((_) => "effect" in _.peerDependencies)
     )
   })
 }
