@@ -1,61 +1,75 @@
 import type * as PlatformError from "@effect/platform/Error"
 import * as FileSystem from "@effect/platform/FileSystem"
+import * as Path from "@effect/platform/Path"
+import Arborist from "@npmcli/arborist"
 import * as Array$ from "effect/Array"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as HashSet from "effect/HashSet"
+import pacote from "pacote"
+import semver from "semver"
 import * as PackageJson from "./PackageJson.js"
 
-export class CannotResolvePackageJsonPathError extends Data.TaggedError("CannotResolvePackageJsonPathError")<{
-  packageName: string
-  issue: unknown
-}> {}
-
 export class PackageJsonFileNotFound extends Data.TaggedError("PackageJsonFileNotFound")<{
-  path: string
+  packageJsonPath: string
   issue: PlatformError.PlatformError
 }> {
   get message() {
-    return "Cannot find the package JSON file at location: " + this.path + ".\n\n" + this.issue
+    return "Cannot find the package JSON file at location: " + this.packageJsonPath + ".\n\n" + this.issue
   }
 }
 
-export const readPackageJson = Effect.fn(function*(path: string) {
+export const readPackageJson = Effect.fn(function*(packagePath: string) {
   const fs = yield* FileSystem.FileSystem
-  const contents = yield* fs.readFileString(path).pipe(
-    Effect.mapError((issue) => new PackageJsonFileNotFound({ path, issue }))
+  const path = yield* Path.Path
+  const packageJsonPath = path.resolve(packagePath, "package.json")
+  const contents = yield* fs.readFileString(packageJsonPath).pipe(
+    Effect.mapError((issue) => new PackageJsonFileNotFound({ packageJsonPath, issue }))
   )
   return yield* PackageJson.decodeJsonString(contents)
 })
 
-export const resolvePathForPackage = (packageName: string) =>
-  Effect.try({
-    // @ts-expect-error
-    try: () => (require as any).resolve(packageName + "/package.json"),
-    catch: (issue) => new CannotResolvePackageJsonPathError({ packageName, issue })
-  }).pipe(
-    Effect.orElse(
-      () =>
-        Effect.try({
-          try: () => import.meta.resolve(packageName + "/package.json"),
-          catch: (issue) => new CannotResolvePackageJsonPathError({ packageName, issue })
-        })
-    ),
-    Effect.map((path) => path.startsWith("file://") ? path.substring("file://".length) : path)
+export const listInstalled = Effect.gen(function*() {
+  const path = yield* Path.Path
+  const arb = new Arborist({ path: path.resolve(".") })
+  const rootNode = yield* Effect.promise(() => arb.loadActual())
+  return pipe(
+    Array$.fromIterable(rootNode.inventory.values()),
+    Array$.filter((_) => _.packageName !== null),
+    Array$.map((_) => new PackageJson.PackageNameAndVersion({ name: _.packageName, version: _.version })),
+    HashSet.fromIterable
   )
+})
 
-export const readLocalPackageJsonForPackage = Effect.fn(
-  function*(packageName: string) {
-    const path = yield* resolvePathForPackage(packageName)
-    return yield* readPackageJson(path)
-  }
-)
-
-export function excludeInstalledPackages(packages: HashSet.HashSet<PackageJson.PackageNameAndVersion>) {
-  return Effect.gen(function*() {
-    const installed = yield* Effect.allSuccesses(
-      HashSet.toValues(packages).map((pkg) => readLocalPackageJsonForPackage(pkg.name))
+export const listPathsFor = (packageNames: Array<string>) =>
+  Effect.gen(function*() {
+    const path = yield* Path.Path
+    const arb = new Arborist({ path: path.resolve(".") })
+    const rootNode = yield* Effect.promise(() => arb.loadActual())
+    return pipe(
+      Array$.fromIterable(rootNode.inventory.values()),
+      Array$.filter((_) => packageNames.indexOf(_.packageName) > -1),
+      Array$.map((_) => _.realpath),
+      Array$.dedupe
     )
-    return Array$.reduce(installed, packages, (acc, _) => HashSet.remove(acc, _.nameAndVersion))
   })
-}
+
+export const list = (packageSpec: PackageJson.PackageNameAndVersion) =>
+  Effect.gen(function*() {
+    const result = yield* Effect.promise(() => pacote.packument(packageSpec.toNameAndVersionSpecifier()))
+    return pipe(
+      Object.keys(result.versions).sort(semver.compareLoose),
+      Array$.map((version) => result.versions[version]),
+      Array$.filter((pkg) => semver.satisfies(pkg.version, packageSpec.version)),
+      Array$.map((pkg) =>
+        new PackageJson.PackageJson({
+          name: pkg.name,
+          version: pkg.version,
+          dependencies: pkg.dependencies || {},
+          peerDependencies: pkg.peerDependencies || {},
+          devDependencies: pkg.devDependencies || {}
+        })
+      )
+    )
+  })

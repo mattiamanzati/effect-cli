@@ -1,8 +1,11 @@
-import { Effect } from "effect"
+import { Effect, pipe } from "effect"
+import * as Array from "effect/Array"
 import * as Data from "effect/Data"
 import * as HashSet from "effect/HashSet"
 import type { ParseError } from "effect/ParseResult"
 import * as Schema from "effect/Schema"
+import npa from "npm-package-arg"
+import semver from "semver"
 
 export const DependenciesRecord = Schema.Record({
   key: Schema.NonEmptyString,
@@ -10,15 +13,9 @@ export const DependenciesRecord = Schema.Record({
 })
 export type DependenciesRecord = Schema.Schema.Type<typeof DependenciesRecord>
 
-export class RepositoryInfo extends Schema.Class<RepositoryInfo>("RepositoryInfo")({
-  url: Schema.optionalWith(Schema.NonEmptyString, { as: "Option" }),
-  directory: Schema.optionalWith(Schema.NonEmptyString, { as: "Option" })
-}) {}
-
 export class PackageJson extends Schema.Class<PackageJson>("PackageJson")({
   name: Schema.NonEmptyString,
   version: Schema.NonEmptyString,
-  repository: Schema.optionalWith(Schema.Union(RepositoryInfo, Schema.String), { as: "Option" }),
   dependencies: Schema.optionalWith(
     DependenciesRecord,
     { default: () => ({}) }
@@ -34,6 +31,14 @@ export class PackageJson extends Schema.Class<PackageJson>("PackageJson")({
 }) {
   get nameAndVersion(): PackageNameAndVersion {
     return new PackageNameAndVersion({ name: this.name, version: this.version })
+  }
+  get anyDependencies() {
+    return pipe(
+      Object.keys(this.dependencies),
+      Array.appendAll(Object.keys(this.devDependencies)),
+      Array.appendAll(Object.keys(this.peerDependencies)),
+      Array.dedupe
+    )
   }
 }
 
@@ -56,6 +61,9 @@ export const decodeJsonString = (contents: string) =>
 
 export const toNameAndVersion = (p: PackageJson) => p.name + "@" + p.version
 
+export const fromSpecifier = (spec: string) =>
+  Effect.sync(() => npa(spec)).pipe(Effect.map((_) => new PackageNameAndVersion({ name: _.name!, version: _.rawSpec })))
+
 export class MalformedPackageJsonError extends Data.TaggedError("MalformedPackageJsonError")<{
   contents: string
   issue: ParseError
@@ -65,6 +73,51 @@ export class MalformedPackageJsonError extends Data.TaggedError("MalformedPackag
   }
 }
 
-export function filterSavedInDeps(dependencies: DependenciesRecord, deps: HashSet.HashSet<PackageNameAndVersion>) {
-  return HashSet.filter(deps, (_) => _.name in dependencies)
+class PackagePeersMatchResult extends Data.TaggedClass("PackagePeersMatchResult")<{
+  packageJson: PackageJson
+  missing: HashSet.HashSet<PackageNameAndVersion>
+  valid: HashSet.HashSet<PackageNameAndVersion>
+  invalid: HashSet.HashSet<PackageNameAndVersion>
+}> {
+  hasPackageMissing(packageName: string) {
+    return HashSet.size(HashSet.filter(this.missing, (_) => _.name === packageName)) > 0
+  }
+  hasValid(packageSpec: PackageNameAndVersion) {
+    return HashSet.has(this.valid, packageSpec)
+  }
+  hasAllPeer(considerMissingValid: boolean) {
+    for (const peerName in this.packageJson.peerDependencies) {
+      if (HashSet.size(HashSet.filter(this.valid, (_) => _.name === peerName)) > 0) continue
+      if (considerMissingValid && HashSet.size(HashSet.filter(this.missing, (_) => _.name === peerName)) > 0) continue
+      return false
+    }
+    return true
+  }
+}
+
+export const matchPeers = (
+  packageJson: PackageJson,
+  peersAvailable: HashSet.HashSet<PackageNameAndVersion>
+) => {
+  let missing = HashSet.empty<PackageNameAndVersion>()
+  let valid = HashSet.empty<PackageNameAndVersion>()
+  let invalid = HashSet.empty<PackageNameAndVersion>()
+  for (const peerPackageName in packageJson.peerDependencies) {
+    const peerPackageVersionSpecifier = packageJson.peerDependencies[peerPackageName]
+    const peersAvailableForThisPackage = HashSet.filter(peersAvailable, (_) => _.name === peerPackageName)
+    if (HashSet.size(peersAvailableForThisPackage) === 0) {
+      missing = HashSet.add(
+        missing,
+        new PackageNameAndVersion({ name: peerPackageName, version: peerPackageVersionSpecifier })
+      )
+    } else {
+      const peersThatSatisfy = HashSet.filter(
+        peersAvailableForThisPackage,
+        (_) => semver.satisfies(_.version, peerPackageVersionSpecifier)
+      )
+      valid = HashSet.union(valid, peersThatSatisfy)
+      invalid = HashSet.union(invalid, HashSet.difference(peersAvailableForThisPackage, peersThatSatisfy))
+    }
+  }
+  return new PackagePeersMatchResult({ packageJson, missing, valid, invalid })
 }

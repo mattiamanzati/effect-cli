@@ -1,176 +1,143 @@
-import * as ReadonlyArray from "effect/Array"
+import * as Array from "effect/Array"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import { pipe } from "effect/Function"
 import * as HashSet from "effect/HashSet"
 import * as Option from "effect/Option"
-import * as Record from "effect/Record"
-import * as EffectMonorepo from "./EffectMonorepo.js"
-import type * as PackageJson from "./PackageJson.js"
-import * as PackageManager from "./PackageManager.js"
+import * as PackageJson from "./PackageJson.js"
 import * as PackageResolver from "./PackageResolver.js"
 
-export const getInstalledEffectPackageJson = PackageResolver.readLocalPackageJsonForPackage("effect")
+class EffectPackageNotFoundError extends Data.TaggedError("EffectPackageNotFoundError") {}
 
-export function getEffectPeerDepFromPackageMonorepo(packageJson: PackageJson.PackageJson) {
-  return Effect.gen(function*() {
-    if (!("effect" in packageJson.peerDependencies)) return Option.none()
-    const effectPackageJson = yield* EffectMonorepo.getEffectGithubMonorepoPackageJson(
-      packageJson.nameAndVersion,
-      "effect"
-    )
-    return Option.some(effectPackageJson.nameAndVersion)
-  })
-}
-
-export class RequiredEffectMismatch extends Data.TaggedClass("RequiredEffectMismatch")<{
-  package: PackageJson.PackageNameAndVersion
-  expectedEffect: PackageJson.PackageNameAndVersion
-  foundInstead: PackageJson.PackageNameAndVersion
+class MultipleEffectPackagesFoundError extends Data.TaggedError("MultipleEffectPackagesFoundError")<{
+  versions: Array<PackageJson.PackageNameAndVersion>
 }> {}
 
-export function process(installedEffect: PackageJson.PackageNameAndVersion, packageNames: Array<string>) {
-  return Effect.gen(function*() {
-    // first, for each package, we resolve the package json from npm we would like to install
-    const toAddPackageJson = yield* Effect.forEach(packageNames, PackageManager.view, {
-      concurrency: "unbounded"
-    })
-    // for each of those, we get the desidered effect version
-    const packagesWithEffectVersion = yield* Effect.forEach(
-      toAddPackageJson,
-      (packageToAdd) =>
-        getEffectPeerDepFromPackageMonorepo(packageToAdd).pipe(
-          Effect.map((effect) => ({ effect, package: packageToAdd }))
-        )
-    )
-    // get those with effect mismatching the currently installed one
-    const effectMismatch = pipe(
-      packagesWithEffectVersion,
-      ReadonlyArray.filterMap((_) =>
-        Option.gen(function*() {
-          const expectedEffect = yield* _.effect
-          if (Equal.equals(expectedEffect, installedEffect)) return yield* Option.none()
-          return new RequiredEffectMismatch({
-            foundInstead: installedEffect,
-            expectedEffect,
-            package: _.package.nameAndVersion
-          })
-        })
-      )
-    )
-    // find alternatives for those
-    const alternativeCompatible = yield* Effect.forEach(
-      effectMismatch,
-      (mismatchEffect) =>
-        EffectMonorepo.getEffectGithubMonorepoPackageJson(installedEffect, mismatchEffect.package.name)
-    )
+export const getInstalledEffect = Effect.gen(function*() {
+  const foundInstalled = HashSet.filter(yield* PackageResolver.listInstalled, (_) => _.name === "effect")
+  if (HashSet.size(foundInstalled) === 0) return yield* new EffectPackageNotFoundError()
+  if (HashSet.size(foundInstalled) > 1) {
+    return yield* new MultipleEffectPackagesFoundError({ versions: HashSet.toValues(foundInstalled) })
+  }
+  return HashSet.toValues(foundInstalled)[0]
+})
 
-    const compatible = pipe(
-      toAddPackageJson,
-      ReadonlyArray.filter(
-        (packageJson) =>
-          Option.isNone(ReadonlyArray.findFirst(
-            effectMismatch,
-            (_) => Equal.equals(_.package, packageJson.nameAndVersion)
-          ))
-      )
-    )
-
-    const allToInstall = pipe(
-      compatible,
-      ReadonlyArray.appendAll(alternativeCompatible),
-      ReadonlyArray.map((_) => _.nameAndVersion),
-      HashSet.fromIterable
-    )
-
-    return { effectMismatch, alternativeCompatible, compatible, allToInstall }
-  })
+class NoPackageVersionCompatibleWithEffectError extends Data.TaggedError("NoPackageVersionCompatibleWithEffectError")<{
+  packageSpec: PackageJson.PackageNameAndVersion
+  effect: PackageJson.PackageNameAndVersion
+}> {
+  get message() {
+    return `No version of ${this.packageSpec} is compatible with ${this.effect}`
+  }
 }
 
-export class PeerToProcess extends Data.Class<{
-  from: PackageJson.PackageNameAndVersion
-  packageName: string
+class NoCandidateForPackageCompatibleWithPeers extends Data.TaggedError("NoCandidateForPackageCompatibleWithPeers")<{
+  packageSpec: PackageJson.PackageNameAndVersion
 }> {}
 
-export function resolveRequiredPeers(
-  packages: HashSet.HashSet<PackageJson.PackageNameAndVersion>
+export function process(
+  installedEffect: PackageJson.PackageNameAndVersion,
+  requestedPackages: Array<PackageJson.PackageNameAndVersion>,
+  alreadyInstalledPackages: HashSet.HashSet<PackageJson.PackageNameAndVersion>
 ) {
   return Effect.gen(function*() {
-    let peers: HashSet.HashSet<PackageJson.PackageNameAndVersion> = HashSet.empty()
-    let otherPeers: Record<string, string> = {}
-    let toProcess: Array<PeerToProcess> = ReadonlyArray.map(
-      ReadonlyArray.fromIterable(packages),
-      (_) => new PeerToProcess({ from: _, packageName: _.name })
-    )
-    let alreadyProcessed = HashSet.empty<PeerToProcess>()
+    const installedEffectAsHash = HashSet.fromIterable([installedEffect])
+    const requestedPackageNames = Array.map(requestedPackages, (_) => _.name)
+    yield* Effect.logInfo("Searching effect-compatible " + requestedPackages.join(" "))
 
-    while (toProcess.length > 0) {
-      const entry = toProcess.shift()!
-      // do not consider effect itself
-      if (entry.packageName === "effect") continue
-      if (HashSet.has(alreadyProcessed, entry)) continue
+    let allCompatiblePackages: Array<PackageJson.PackageJson> = []
+    let allPeerPackages = HashSet.empty<string>()
 
-      // get package from monorepo
-      yield* Effect.logDebug(
-        "Checking " + entry.packageName + " at tag " + entry.from.toNameAndVersionSpecifier() + "..."
+    for (const pkg of requestedPackages) {
+      const packageList = yield* PackageResolver.list(pkg)
+      const effectMatchedList = pipe(
+        packageList,
+        Array.map((_) => PackageJson.matchPeers(_, installedEffectAsHash)),
+        Array.filter((_) => _.hasValid(installedEffect))
       )
-      const packageJson = yield* EffectMonorepo.getEffectGithubMonorepoPackageJson(entry.from, entry.packageName)
 
-      // add non-workspace peers
-      const nonWorkspacePeers = pipe(
-        packageJson.peerDependencies,
-        Record.filter((version) => !version.toLowerCase().startsWith("workspace:^"))
+      if (effectMatchedList.length === 0) {
+        return yield* new NoPackageVersionCompatibleWithEffectError({ packageSpec: pkg, effect: installedEffect })
+      }
+
+      allCompatiblePackages = Array.appendAll(
+        allCompatiblePackages,
+        Array.map(effectMatchedList, (_) => _.packageJson)
       )
-      otherPeers = { ...otherPeers, ...nonWorkspacePeers }
-      // add peers to queue
-      const workspacePeers = pipe(
-        packageJson.peerDependencies,
-        Record.filter((version) => version.toLowerCase().startsWith("workspace:^")),
-        Record.keys,
-        ReadonlyArray.map((packageName) => new PeerToProcess({ from: entry.from, packageName }))
+      yield* Effect.logDebug(pkg + ": " + Array.map(effectMatchedList, (_) => _.packageJson.version).join(" "))
+      const peerNamesForMatches = pipe(
+        effectMatchedList,
+        Array.map((_) => HashSet.toValues(_.missing)),
+        Array.flatten,
+        Array.map((_) => _.name),
+        HashSet.fromIterable
       )
-      const workspaceDependency = pipe(
-        packageJson.dependencies,
-        Record.filter((version) => version.toLowerCase().startsWith("workspace:^")),
-        Record.keys,
-        ReadonlyArray.map((packageName) => new PeerToProcess({ from: entry.from, packageName }))
-      )
-      toProcess = pipe(
-        toProcess,
-        ReadonlyArray.appendAll(workspacePeers),
-        ReadonlyArray.appendAll(workspaceDependency),
-        ReadonlyArray.dedupe
-      )
-      peers = HashSet.add(peers, packageJson.nameAndVersion)
-      alreadyProcessed = HashSet.add(alreadyProcessed, entry)
+      allPeerPackages = HashSet.union(allPeerPackages, peerNamesForMatches)
     }
-    peers = HashSet.difference(peers, packages)
 
-    return ({
-      peers,
-      otherPeers
-    })
+    yield* Effect.logInfo("involved peers " + Array.fromIterable(allPeerPackages).join(" "))
+
+    const installedPeers = pipe(
+      alreadyInstalledPackages,
+      HashSet.filter((_) => HashSet.has(allPeerPackages, _.name)),
+      HashSet.filter((_) => requestedPackageNames.indexOf(_.name) === -1)
+    )
+
+    if (HashSet.size(installedPeers) > 0) {
+      yield* Effect.logInfo(
+        "Checking packages compatible with already installed " + Array.fromIterable(installedPeers).join(" ")
+      )
+    }
+
+    let currentCandidates = allCompatiblePackages
+    let finalInstallSet = HashSet.empty<PackageJson.PackageJson>()
+
+    while (true) {
+      let candidateRemoved = false
+      finalInstallSet = HashSet.empty()
+      for (const requestedPkg of requestedPackages) {
+        // start by picking the latest version
+        const versionToTest = Array.findLast(currentCandidates, (candidate) => candidate.name === requestedPkg.name)
+        if (Option.isNone(versionToTest)) {
+          return yield* new NoCandidateForPackageCompatibleWithPeers({ packageSpec: requestedPkg })
+        }
+        const pickedVersion = versionToTest.value
+
+        const peersForTest = pipe(
+          installedPeers,
+          HashSet.union(HashSet.fromIterable(Array.map(currentCandidates, (_) => _.nameAndVersion)))
+        )
+
+        const testResult = PackageJson.matchPeers(pickedVersion, peersForTest)
+        // this package is satisfied, go to next
+        if (testResult.hasAllPeer(true)) {
+          finalInstallSet = HashSet.add(finalInstallSet, pickedVersion)
+          continue
+        }
+
+        // we are not, exclude this candidate and retry
+        yield* Effect.logDebug(
+          pickedVersion.nameAndVersion + " is not satisfied by peers "
+        )
+        candidateRemoved = true
+        currentCandidates = Array.filter(currentCandidates, (_) => !Equal.equals(_, pickedVersion))
+        break
+      }
+      if (!candidateRemoved) break
+    }
+    return finalInstallSet
   })
 }
 
-function isProbablyEffectMonorepoPackageByName(packageName: string) {
-  if (packageName === "@effect/eslint-plugin") return false
-  return packageName === "effect" || packageName.startsWith("@effect/")
-}
+export function listDependenciesRequireEffect(packageJson: PackageJson.PackageJson) {
+  return Effect.gen(function*() {
+    const paths = yield* PackageResolver.listPathsFor(packageJson.anyDependencies)
 
-export const getInstalledMonorepoPackages = Effect.gen(function*() {
-  const myPackageJson = yield* PackageResolver.readPackageJson("package.json")
-  const effectPackages = pipe(
-    Record.keys(myPackageJson.dependencies),
-    ReadonlyArray.appendAll(Record.keys(myPackageJson.devDependencies)),
-    ReadonlyArray.appendAll(Record.keys(myPackageJson.peerDependencies)),
-    ReadonlyArray.map((_) => _.toLowerCase()),
-    ReadonlyArray.filter(isProbablyEffectMonorepoPackageByName)
-  )
-  const packageJsons = yield* Effect.forEach(effectPackages, PackageResolver.readLocalPackageJsonForPackage)
-  return pipe(
-    packageJsons,
-    ReadonlyArray.filter((_) => Option.isSome(EffectMonorepo.parseEffectMonorepoDirectory(_)))
-  )
-})
+    return pipe(
+      yield* Effect.forEach(paths, (_) => PackageResolver.readPackageJson(_)),
+      Array.filter((_) => "effect" in _.peerDependencies),
+      Array.map((_) => _.nameAndVersion)
+    )
+  })
+}

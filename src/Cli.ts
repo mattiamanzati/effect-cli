@@ -1,10 +1,9 @@
 import * as Args from "@effect/cli/Args"
 import * as Command from "@effect/cli/Command"
 import * as Options from "@effect/cli/Options"
-import * as ReadonlyArray from "effect/Array"
+import { Array, Data, HashSet, pipe } from "effect"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
-import * as HashSet from "effect/HashSet"
+import * as Option from "effect/Option"
 import * as PackageJson from "./PackageJson.js"
 import * as PackageManager from "./PackageManager.js"
 import * as PackageResolver from "./PackageResolver.js"
@@ -35,57 +34,44 @@ const excludeEffectPeers = Options.boolean("exclude-effect-peers").pipe(
   Options.withDescription("Installs peer effect packages as well")
 )
 
+const ignoreInstalled = Options.boolean("ignore-installed").pipe(
+  Options.withDefault(false),
+  Options.withDescription("Ignore already installed packages versions while searching compatible ones")
+)
+
 const install = Command.make(
   "install",
-  { packages, save, saveDev, savePeer, excludeEffectPeers },
+  { packages, save, saveDev, savePeer, excludeEffectPeers, ignoreInstalled },
   (args) =>
     Effect.gen(function*() {
-      const effectPackageJson = yield* ResolutionAlgo.getInstalledEffectPackageJson
-      yield* Effect.logInfo("Detected installed effect@" + effectPackageJson.version)
+      const installedEffect = yield* ResolutionAlgo.getInstalledEffect
+      yield* Effect.logInfo("Detected installed " + installedEffect)
 
-      yield* Effect.log("Checking compatibility...")
-      const { allToInstall, alternativeCompatible, effectMismatch } = yield* ResolutionAlgo.process(
-        effectPackageJson.nameAndVersion,
-        args.packages
+      const requestedPackages = yield* Effect.forEach(args.packages, PackageJson.fromSpecifier)
+      const alreadyInstalledPackages = !args.ignoreInstalled ? yield* PackageResolver.listInstalled : HashSet.empty()
+
+      const finalInstallSet = yield* ResolutionAlgo.process(
+        installedEffect,
+        requestedPackages,
+        alreadyInstalledPackages
       )
 
-      let peersToInstall = HashSet.empty<PackageJson.PackageNameAndVersion>()
-      if (!args.excludeEffectPeers) {
-        yield* Effect.log("Resolving effect peer-deps...")
-        const { peers } = yield* ResolutionAlgo.resolveRequiredPeers(allToInstall)
-        peersToInstall = peers
-      }
-
-      for (const mismatch of effectMismatch) {
-        yield* Effect.logError(
-          mismatch.package + " requires " +
-            mismatch.expectedEffect
-        )
-      }
-      for (const alternative of alternativeCompatible) {
-        yield* Effect.logWarning(alternative.nameAndVersion + " will be used instead")
-      }
-
-      if (HashSet.size(peersToInstall) > 0) {
-        yield* Effect.logWarning("Following packages will be added as well " + Array.from(peersToInstall).join(" "))
-      }
-
-      if (HashSet.size(allToInstall) > 0) {
-        yield* Effect.log("About to install packages " + Array.from(allToInstall).join(" "))
-        yield* PackageManager.install(allToInstall, args)
-      }
-
-      if (HashSet.size(peersToInstall) > 0) {
-        yield* Effect.log("About to install peers " + Array.from(peersToInstall).join(" "))
-        yield* PackageManager.install(peersToInstall, args)
-      }
+      yield* Effect.logInfo("Installing " + Array.fromIterable(finalInstallSet).map((_) => _.nameAndVersion).join(" "))
     })
 )
 
 const version = Args.text({ name: "version" }).pipe(
-  Args.withDefault("latest"),
-  Args.withDescription("What version to update effect to")
+  Args.withDefault("*"),
+  Args.withDescription("Effect version to update to")
 )
+
+class NoEffectVersionFoundError extends Data.TaggedError("NoEffectVersionFoundError")<{
+  effectSpec: PackageJson.PackageNameAndVersion
+}> {
+  get message() {
+    return `Could not find a package matching ${this.effectSpec}`
+  }
+}
 
 const update = Command.make(
   "update",
@@ -93,88 +79,75 @@ const update = Command.make(
   (args) =>
     Effect.gen(function*() {
       yield* Effect.logInfo("Reading package.json...")
-      const myPackageJson = yield* PackageResolver.readPackageJson("package.json")
+      const myPackageJson = yield* PackageResolver.readPackageJson(".")
 
-      const newEffectPackageJson = yield* PackageManager.view("effect@" + args.version)
-      yield* Effect.logInfo("Checking packages for " + newEffectPackageJson.nameAndVersion)
-
-      yield* Effect.logInfo("Checking installed packages...")
-      const installedPackages = pipe(
-        yield* ResolutionAlgo.getInstalledMonorepoPackages,
-        ReadonlyArray.filter((_) => _.name !== "effect"),
-        ReadonlyArray.append(newEffectPackageJson),
-        ReadonlyArray.map((_) => _.nameAndVersion)
+      yield* Effect.logInfo("Searching effect version...")
+      const effectSpec = new PackageJson.PackageNameAndVersion({ name: "effect", version: args.version })
+      const maybeEffectVersion = pipe(
+        yield* PackageResolver.list(effectSpec),
+        Array.last
       )
+      if (Option.isNone(maybeEffectVersion)) {
+        return yield* new NoEffectVersionFoundError({ effectSpec })
+      }
+      const chosenEffectVersion = maybeEffectVersion.value.nameAndVersion
 
+      yield* Effect.logInfo("Checking packages using effect...")
+      const packagesWithEffect = yield* ResolutionAlgo.listDependenciesRequireEffect(myPackageJson)
+
+      const requestedPackages = packagesWithEffect.map((_) =>
+        new PackageJson.PackageNameAndVersion({ name: _.name, version: "*" })
+      )
       yield* Effect.logInfo(
-        "Checking compatibility of " + installedPackages.join(" ") + "..."
+        "Searching compatible with " + chosenEffectVersion + " for " + requestedPackages.join(" ")
       )
-      const { allToInstall, alternativeCompatible, effectMismatch } = yield* ResolutionAlgo.process(
-        newEffectPackageJson.nameAndVersion,
-        installedPackages.map((_) => _.toNameAndVersionSpecifier())
+      const packagesChoses = yield* ResolutionAlgo.process(
+        chosenEffectVersion,
+        requestedPackages,
+        HashSet.fromIterable([chosenEffectVersion])
+      )
+      const finalInstallSet = pipe(
+        packagesChoses,
+        HashSet.map((_) => _.nameAndVersion),
+        HashSet.add(chosenEffectVersion)
       )
 
-      for (const mismatch of effectMismatch) {
-        yield* Effect.logError(mismatch.package + " requires " + mismatch.expectedEffect)
-      }
-      for (const alternative of alternativeCompatible) {
-        yield* Effect.logWarning(alternative.nameAndVersion + " will be used instead")
-      }
+      const devDependencies = pipe(
+        finalInstallSet,
+        HashSet.filter((_) => _.name in myPackageJson.devDependencies)
+      )
+      const dependencies = pipe(
+        finalInstallSet,
+        HashSet.difference(devDependencies)
+      )
 
-      const devDeps = PackageJson.filterSavedInDeps(myPackageJson.devDependencies, allToInstall)
-      if (HashSet.size(devDeps) > 0) {
-        yield* Effect.log("About to install dev dependencies " + Array.from(devDeps).join(" "))
-        yield* PackageManager.install(devDeps, { save: false, saveDev: true, savePeer: false })
+      if (HashSet.size(devDependencies) > 0) {
+        yield* Effect.logInfo("Installing devDependencies " + Array.fromIterable(devDependencies).join(" "))
+        yield* PackageManager.install(devDependencies, { save: false, saveDev: true, savePeer: false })
       }
-
-      const deps = PackageJson.filterSavedInDeps(myPackageJson.dependencies, allToInstall)
-      if (HashSet.size(deps) > 0) {
-        yield* Effect.log("About to install dependencies " + Array.from(deps).join(" "))
-        yield* PackageManager.install(deps, { save: true, saveDev: false, savePeer: false })
+      if (HashSet.size(dependencies) > 0) {
+        yield* Effect.logInfo("Installing dependencies " + Array.fromIterable(dependencies).join(" "))
+        yield* PackageManager.install(dependencies, { save: true, saveDev: false, savePeer: false })
       }
-
-      yield* Effect.log("Deduping...")
-      yield* PackageManager.dedupe
     })
 )
 
-const doctor = Command.make(
-  "doctor",
+const test = Command.make(
+  "test",
   {},
   () =>
     Effect.gen(function*() {
-      const newEffectPackageJson = yield* ResolutionAlgo.getInstalledEffectPackageJson
-      yield* Effect.logInfo("Checking packages for " + newEffectPackageJson.nameAndVersion)
-
-      yield* Effect.logInfo("Checking installed packages...")
-      const installedPackages = pipe(
-        yield* ResolutionAlgo.getInstalledMonorepoPackages,
-        ReadonlyArray.filter((_) => _.name !== "effect"),
-        ReadonlyArray.map((_) => _.nameAndVersion)
+      const myPackageJson = yield* PackageResolver.readPackageJson(".")
+      yield* Effect.log(
+        yield* ResolutionAlgo.listDependenciesRequireEffect(myPackageJson)
       )
-
-      if (installedPackages.length === 0) return yield* Effect.log("No installed effect packages.")
-
-      yield* Effect.logInfo(
-        "Checking compatibility of " + installedPackages.join(" ") + "..."
-      )
-      const { compatible, effectMismatch } = yield* ResolutionAlgo.process(
-        newEffectPackageJson.nameAndVersion,
-        installedPackages.map((_) => _.toNameAndVersionSpecifier())
-      )
-
-      for (const mismatch of effectMismatch) {
-        yield* Effect.logError(mismatch.package + " requires " + mismatch.expectedEffect)
-      }
-
-      yield* Effect.log("compatible packages " + compatible.map((_) => _.nameAndVersion).join(" "))
     })
 )
 
 const effectCli = Command.make(
   "effect-cli"
 ).pipe(
-  Command.withSubcommands([install, update, doctor])
+  Command.withSubcommands([install, update, test])
 )
 
 export const run: any = Command.run(effectCli, {

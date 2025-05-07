@@ -6,21 +6,11 @@ import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import { identity, pipe } from "effect/Function"
 import type * as HashSet from "effect/HashSet"
-import * as PackageJson from "./PackageJson.js"
+import type * as PackageJson from "./PackageJson.js"
 
 export class PackageManagerError extends Data.TaggedError("PackageManagerError")<{
   issue: PlatformError.PlatformError
 }> {}
-
-export const view = (packageName: string) =>
-  Effect.gen(function*() {
-    const executor = yield* CommandExecutor.CommandExecutor
-    const command = Command.make("pnpm", "view", packageName, "--json")
-    const contents = yield* executor.string(command).pipe(
-      Effect.mapError((issue) => new PackageManagerError({ issue }))
-    )
-    return yield* PackageJson.decodeJsonString(contents)
-  })
 
 export const install = (packageNames: HashSet.HashSet<PackageJson.PackageNameAndVersion>, opts: {
   save: boolean
